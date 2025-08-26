@@ -13,19 +13,24 @@ import sys
 # Add current directory to Python path to import llload.py
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Try to import llload.py functionality
-try:
-    from llload import (
-        get_k_nearest_low_risk_routes, 
-        build_and_save_map,
-        G, flood_df, ROUTE_COUNT
-    )
-    LLLOAD_AVAILABLE = True
-    print("✅ llload.py successfully imported")
-except ImportError as e:
-    print(f"⚠️ Warning: Could not import llload.py - {e}")
-    print("📝 Using fallback static data instead")
-    LLLOAD_AVAILABLE = False
+# Try to import llload.py functionality (can be disabled via env to keep Vercel light)
+ENABLE_LLLOAD = os.getenv("ENABLE_LLLOAD", "0").lower() in ("1", "true", "yes")
+LLLOAD_AVAILABLE = False
+if ENABLE_LLLOAD:
+    try:
+        from llload import (
+            get_k_nearest_low_risk_routes,
+            build_and_save_map,
+            G, flood_df, ROUTE_COUNT
+        )
+        LLLOAD_AVAILABLE = True
+        print("✅ llload.py successfully imported")
+    except ImportError as e:
+        print(f"⚠️ Warning: Could not import llload.py - {e}")
+        print("📝 Using fallback static data instead")
+        LLLOAD_AVAILABLE = False
+else:
+    print("ℹ️ ENABLE_LLLOAD is disabled. Running with static fallback data only.")
 
 app = Flask(__name__)
 CORS(app)
