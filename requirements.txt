@@ -1,0 +1,11 @@
+flask==3.0.3
+flask-cors==4.0.0
+werkzeug==3.0.3
+osmnx
+networkx
+pandas
+numpy
+geopandas
+shapely
+folium
+rapidfuzz
