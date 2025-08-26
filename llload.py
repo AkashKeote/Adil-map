@@ -61,6 +61,14 @@ SAMPLE_FACTOR = 5               # sample 1/N edges for lighter HTML
 MAX_POIS_PER_CAT = 500          # cap per category to keep HTML smaller
 ROUTE_COUNT = 5                 # how many evacuation routes to draw
 
+# Light mode to reduce memory/CPU for constrained environments
+LLLOAD_LIGHT = os.environ.get("LLLOAD_LIGHT", "0").strip() in {"1", "true", "True"}
+if LLLOAD_LIGHT:
+    # In light mode, we avoid heavy layers and shrink sampling
+    SAMPLE_FACTOR = max(SAMPLE_FACTOR, 20)
+    MAX_POIS_PER_CAT = 0  # skip POIs entirely
+    print("ℹ️ LLLOAD_LIGHT=1: Skipping POIs and using higher sampling for roads")
+
 # Risk color map
 RISK_COLOR = {
     "low": "#1a9850",
@@ -194,47 +202,56 @@ nodeid_to_region_idx = dict(zip(node_ids.tolist(), nearest_region_idx_per_node.t
 # ----------------------------
 # Build sampled edges GeoJSON colored by risk (by origin node’s region)
 # ----------------------------
-print("🧱 Preparing risk-colored road layer...")
-edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True, fill_edge_geometry=True)
-if "u" not in edges_gdf.columns or "v" not in edges_gdf.columns:
-    edges_gdf = edges_gdf.reset_index()
-
-edges_gdf["_u"] = edges_gdf["u"].astype(int)
-edges_gdf["region_idx"] = edges_gdf["_u"].map(nodeid_to_region_idx)
-edges_gdf["region_name"] = edges_gdf["region_idx"].apply(
-    lambda i: regions[i] if (isinstance(i, (int, np.integer)) and 0 <= i < n_regions) else "unknown"
-)
-edges_gdf["risk_level"] = edges_gdf["region_idx"].apply(
-    lambda i: region_risks[i] if (isinstance(i, (int, np.integer)) and 0 <= i < n_regions) else "unknown"
-)
-
-edges_gdf_sampled = edges_gdf.iloc[::SAMPLE_FACTOR].copy()
+edges_gdf = None
+edges_gdf_sampled = None
 def edge_style(feature):
-    risk = str(feature["properties"].get("risk_level", "unknown")).lower()
+    risk = str(feature.get("properties", {}).get("risk_level", "unknown")).lower()
     color = RISK_COLOR.get(risk, RISK_COLOR["unknown"])
     return {"color": color, "weight": 1.2, "opacity": 0.8}
+
+if not LLLOAD_LIGHT:
+    print("🧱 Preparing risk-colored road layer...")
+    edges_gdf = ox.graph_to_gdfs(G, nodes=False, edges=True, fill_edge_geometry=True)
+    if "u" not in edges_gdf.columns or "v" not in edges_gdf.columns:
+        edges_gdf = edges_gdf.reset_index()
+
+    edges_gdf["_u"] = edges_gdf["u"].astype(int)
+    edges_gdf["region_idx"] = edges_gdf["_u"].map(nodeid_to_region_idx)
+    edges_gdf["region_name"] = edges_gdf["region_idx"].apply(
+        lambda i: regions[i] if (isinstance(i, (int, np.integer)) and 0 <= i < n_regions) else "unknown"
+    )
+    edges_gdf["risk_level"] = edges_gdf["region_idx"].apply(
+        lambda i: region_risks[i] if (isinstance(i, (int, np.integer)) and 0 <= i < n_regions) else "unknown"
+    )
+
+    edges_gdf_sampled = edges_gdf.iloc[::SAMPLE_FACTOR].copy()
+else:
+    print("⏭️  Skipping risk-colored road layer (LLLOAD_LIGHT)")
 
 # ----------------------------
 # Fetch POIs (cap per category)
 # ----------------------------
-print("📍 Fetching POIs (capped per category)...")
 pois_by_cat = {}
-for cat, (tag, icon, color) in POI_CATEGORIES.items():
-    try:
-        gdf = ox.features_from_place(PLACE, tag)
-        if gdf is None or gdf.empty:
+if MAX_POIS_PER_CAT <= 0:
+    print("⏭️  Skipping POIs (LLLOAD_LIGHT)")
+else:
+    print("📍 Fetching POIs (capped per category)...")
+    for cat, (tag, icon, color) in POI_CATEGORIES.items():
+        try:
+            gdf = ox.features_from_place(PLACE, tag)
+            if gdf is None or gdf.empty:
+                pois_by_cat[cat] = None
+                continue
+            gdf = gdf.to_crs(epsg=4326)
+            gdf["geometry"] = gdf.geometry.centroid
+            if len(gdf) > MAX_POIS_PER_CAT:
+                gdf = gdf.sample(MAX_POIS_PER_CAT, random_state=1)
+            pois_by_cat[cat] = gdf
+            print(f"  • {cat}: {len(gdf)}")
+        except Exception as e:
+            print(f"  ⚠️ {cat}: {e}")
             pois_by_cat[cat] = None
-            continue
-        gdf = gdf.to_crs(epsg=4326)
-        gdf["geometry"] = gdf.geometry.centroid
-        if len(gdf) > MAX_POIS_PER_CAT:
-            gdf = gdf.sample(MAX_POIS_PER_CAT, random_state=1)
-        pois_by_cat[cat] = gdf
-        print(f"  • {cat}: {len(gdf)}")
-    except Exception as e:
-        print(f"  ⚠️ {cat}: {e}")
-        pois_by_cat[cat] = None
-print("✅ POIs ready.")
+    print("✅ POIs ready.")
 
 # ----------------------------
 # Route finder (k nearest low-risk)
@@ -324,18 +341,19 @@ def build_and_save_map(start_region_name: str, routes: list, out_file: str):
     LocateControl(auto_start=False).add_to(m)
 
     # Risk-colored road layer (enhanced styling from alit.py)
-    gj = GeoJson(
-        data=edges_gdf_sampled.__geo_interface__,
-        name="Roads (risk-colored, sampled)",
-        style_function=lambda f: {"color": RISK_COLOR.get(str(f["properties"].get("risk_level","unknown")).lower(), "#9e9e9e"),
-                                  "weight":1.2, "opacity":0.9},
-        tooltip=folium.GeoJsonTooltip(
-            fields=["region_name", "risk_level"],
-            aliases=["Region", "Risk"],
-            sticky=True
-        ),
-    )
-    gj.add_to(m)
+    if edges_gdf_sampled is not None and not edges_gdf_sampled.empty:
+        gj = GeoJson(
+            data=edges_gdf_sampled.__geo_interface__,
+            name="Roads (risk-colored, sampled)",
+            style_function=lambda f: {"color": RISK_COLOR.get(str(f.get("properties", {}).get("risk_level","unknown")).lower(), "#9e9e9e"),
+                                      "weight":1.2, "opacity":0.9},
+            tooltip=folium.GeoJsonTooltip(
+                fields=["region_name", "risk_level"],
+                aliases=["Region", "Risk"],
+                sticky=True
+            ),
+        )
+        gj.add_to(m)
 
     # Region markers clustered (enhanced from alit.py)
     rc = MarkerCluster(name=f"Regions ({len(flood_df)})")
